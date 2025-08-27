@@ -1,0 +1,134 @@
+# Configuration file for arithmetic dataset generation and training
+
+# Dataset Generation
+dataset:
+  # Number of examples to generate
+  train_examples: 12880
+  test_examples: 1024
+  
+  
+  # Data format parameters
+  max_operand_length: 5  # Maximum digits per operand
+  min_operand_length: 1   # Minimum digits per operand
+  flip_result: true       # Whether to flip the digits in the result
+  
+  # Token/symbol parameters  
+  operators: ["+"]        # Supported arithmetic operations
+  
+# Tokenizer Configuration
+tokenizer:
+  # Special tokens
+  special_tokens:
+    bos_token: "[BOS]"
+    eos_token: "[EOS]"
+    unk_token: "[UNK]"
+    pad_token: "[PAD]"
+    mask_token: "[MASK]"
+  
+  # Token IDs (will be automatically assigned)
+  token_ids:
+    bos_token_id: 0
+    eos_token_id: 1
+    unk_token_id: 2
+    pad_token_id: 3
+    mask_token_id: 4
+
+# Data Loading
+data_loader:
+  batch_size: 64  # Number of examples per step (across all GPUs)
+  shuffle: true
+  use_tokenizer: true  # Whether to use the trained tokenizer
+  max_length: 64  # Maximum sequence length for arithmetic expressions
+  split_token: "="  # Token that separates input from target (for masking training)
+  
+# Training Parameters
+training:
+  # Model architecture
+  model:
+    vocab_size: 20  # Will be updated automatically by tokenizer (digits + operators + special tokens)
+    num_layers: 12  
+    num_heads: 8   
+    model_dim: 256  # 8 heads × 32 head_dim = 256
+    head_dim: 32   # Dimension per attention head (256/8=32)
+    max_seq_len: 64  # Much shorter for arithmetic expressions
+    vocab_multiple: 128  # Round vocab size to nearest multiple
+    # Model-specific parameters
+    rope_base_freq: 1024  # Base frequency for rotary embeddings
+    attn_scale: 0.12      # Attention scaling factor
+    tanh_softcap_scale: 30.0     # Tanh softcapping scale
+    tanh_softcap_divisor: 7.5    # Tanh softcapping divisor
+    mlp_ratio: 4          # MLP hidden dimension ratio
+    scalars_size_6_layers: 32  # Scalars parameter size for 6-layer model
+    scalars_size_formula_base: 64  # Base size for scalars formula
+    scalars_size_formula_multiplier: 5  # Multiplier for scalars formula
+    scalars_size_formula_offset: 16     # Offset for scalars formula
+    
+  # Optimization
+  optimizer:
+    type: "mixed"  # Use both DistAdam and Muon
+    adam:
+      lr: 0.008
+      betas: [0.8, 0.95]
+      eps: 1e-10
+      weight_decay: 0.0
+    muon:
+      lr: 0.05
+      momentum: 0.95
+      weight_decay: 0.0
+      momentum_warmup_steps: 300
+  
+  # Learning rate schedule
+  lr_schedule:
+    # Epoch-based or iteration-based training (choose one)
+    num_epochs: 10               # Set this to use epoch-based training
+    num_iterations: null         # Used if num_epochs is null (legacy mode)
+    cooldown_frac: 0.45          # Fraction of training to cooldown (0.45 = last 45%)
+    final_lr_ratio: 0.1          # Final LR as ratio of initial LR
+  
+  # Attention window
+  attention:
+    block_size: 64        # Match sequence length
+  
+  # Training data  
+  data:
+    sequence_length: 4096  # Total tokens per rank (must be multiple of 64 for BLOCK_SIZE)
+    align_to_bos: true
+    world_size: 8
+  
+  # Evaluation
+  evaluation:
+    val_loss_every: 125
+    save_checkpoint: true
+    max_seq_len_check: 64  # Maximum sequence length for stopping generation
+  
+  # Hardware
+  hardware:
+    device: "cuda"
+    compile_model: false  # Disable compilation to avoid GEMM backend issues
+    use_fp8: false
+    warmup_steps: 10
+
+# Inference Parameters
+inference:
+  max_length: 20        # Default max generation length
+  debug_top_k: 3        # Number of top predictions to show during debug
+  debug_steps: 5        # Number of initial steps to show debug for
+  default_prompt: "[BOS] 5 + 3 ="  # Default arithmetic prompt
+
+# File Paths - Centralized path management
+paths:
+  # Data directories
+  data_dir: "data"                          # Main data directory
+  dataset_dir: "data/datasets"              # Generated datasets (train.json, test.json)
+  tokenizer_dir: "data/tokenizers"          # Tokenizer files
+  
+  # Model and training outputs  
+  checkpoint_dir: "checkpoints"             # Model checkpoints
+  log_dir: "logs"                           # Training logs
+  
+  # Specific file paths (relative to respective dirs)
+  train_file: "train.json"                  # Training dataset filename
+  test_file: "test.json"                    # Test dataset filename
+  tokenizer_file: "tokenizer.json"          # Main tokenizer file
+  vocab_info_file: "tokenizer_vocab.json"  # Vocabulary metadata
+

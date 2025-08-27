@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Proper inference loader for modded-nanogpt that matches the exact training architecture.
-Simplified for inference without distributed training, FlexAttention, or FP8 components.
+Inference script for modded-nanogpt adapted for arithmetic tasks.
+Loads config-based model architecture and arithmetic tokenizer.
 
-uv run inference_proper.py logs/3ab5c844-9660-44cb-bcf5-30d4e24240b6/state_step001750.pt --prompt "The weather today is" --max-length 10 --temperature 0.95
+Usage:
+python inference.py checkpoints/model.pt --prompt "[BOS] 5 + 3 =" --max-length 10
 """
 
 import os
@@ -13,7 +14,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-import tiktoken
+from tokenizers import Tokenizer
+from utils.config_loader import load_config
+import json
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
@@ -29,10 +32,11 @@ class CastedLinear(nn.Linear):
 
 class Rotary(nn.Module):
     """Rotary positional embeddings - matches train_gpt.py exactly"""
-    def __init__(self, dim: int, max_seq_len: int):
+    def __init__(self, dim: int, max_seq_len: int, config=None):
         super().__init__()
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        base_freq = config.get('training.model.rope_base_freq', 1024) if config else 1024
+        angular_freq = (1 / base_freq) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
@@ -49,19 +53,19 @@ class Rotary(nn.Module):
 
 class CausalSelfAttention(nn.Module):
     """Simplified attention for inference - matches train_gpt.py structure"""
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, config=None):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = head_dim
-        hdim = num_heads * head_dim
+        self.head_dim = config.get('training.model.head_dim', 128) if config else 128
+        hdim = num_heads * self.head_dim
         
         # Merged QKV weights (matches train_gpt.py exactly)
         self.qkv_w = nn.Parameter(torch.randn(3, hdim, dim))  # Will be loaded from checkpoint
-        self.rotary = Rotary(head_dim, max_seq_len)
+        self.rotary = Rotary(self.head_dim, max_seq_len, config)
         self.c_proj = CastedLinear(hdim, dim, bias=False)
         
         # Attention scale (matches train_gpt.py)
-        self.attn_scale = 0.12
+        self.attn_scale = config.get('training.model.attn_scale', 0.12) if config else 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor):
         B, T = x.size(0), x.size(1)
@@ -106,9 +110,10 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     """MLP block - matches train_gpt.py exactly"""
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, config=None):
         super().__init__()
-        hdim = 4 * dim
+        mlp_ratio = config.get('training.model.mlp_ratio', 4) if config else 4
+        hdim = mlp_ratio * dim
         self.c_fc = CastedLinear(dim, hdim, bias=False)
         self.c_proj = CastedLinear(hdim, dim, bias=False)
 
@@ -120,11 +125,12 @@ class MLP(nn.Module):
 
 class Block(nn.Module):
     """Transformer block - matches train_gpt.py structure"""
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, num_layers: int, config=None):
         super().__init__()
-        # Skip attention of blocks.7 (matches train_gpt.py line 376)
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        # Skip attention of certain layers (adapt for different num_layers)
+        skip_layer = num_layers // 2 + 1 if num_layers > 7 else None
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len, config) if layer_idx != skip_layer else None
+        self.mlp = MLP(dim, config)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor):
         # Skip connection mixing (matches train_gpt.py line 380)
@@ -137,24 +143,35 @@ class Block(nn.Module):
 
 class GPT(nn.Module):
     """Main GPT model - matches train_gpt.py architecture exactly"""
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, config=None):
         super().__init__()
-        vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.config = config  # Store config for use in forward method
+        vocab_multiple = config.get('training.model.vocab_multiple', 128) if config else 128
+        vocab_size = next_multiple_of_n(vocab_size, n=vocab_multiple)
         
         # Embeddings (matches train_gpt.py lines 396-399)
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         
         # Transformer blocks
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, num_layers, config) for i in range(num_layers)])
         
         # Language modeling head (simplified, no FP8)
         self.lm_head = CastedLinear(model_dim, vocab_size, bias=False)
         
-        # Scalars parameter (matches train_gpt.py structure + padding)
-        # Original has padding for distributed training: (-num_layers * 5) % world_size
-        # For checkpoint compatibility, we'll use the exact size from checkpoint (64)
-        self.scalars = nn.Parameter(torch.ones(64))  # Will be loaded from checkpoint
+        # Scalars parameter (matches checkpoint size)
+        # For 6-layer model, the checkpoint has 32 scalars
+        if config:
+            if num_layers == 6:
+                scalar_size = config.get('training.model.scalars_size_6_layers', 32)
+            else:
+                base = config.get('training.model.scalars_size_formula_base', 64)
+                mult = config.get('training.model.scalars_size_formula_multiplier', 5)
+                offset = config.get('training.model.scalars_size_formula_offset', 16)
+                scalar_size = max(base, mult * num_layers + offset)
+        else:
+            scalar_size = 32 if num_layers == 6 else max(64, 5 * num_layers + 16)
+        self.scalars = nn.Parameter(torch.ones(scalar_size))
         
         self.vocab_size = vocab_size
         self.model_dim = model_dim
@@ -165,10 +182,19 @@ class GPT(nn.Module):
         assert input_seq.ndim == 2  # (batch_size, seq_len)
         B, T = input_seq.shape
         
-        # Token value embeddings (matches train_gpt.py lines 465-468)
+        # Token value embeddings (adapt pattern for different num_layers)
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure
-        ve_pattern = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        if self.num_layers >= 6:
+            # Original pattern for 6+ layers: 012...012
+            ve_pattern = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
+        else:
+            # For fewer layers, distribute the available embeddings
+            ve_pattern = []
+            for i in range(self.num_layers):
+                if i < len(ve):
+                    ve_pattern.append(ve[i])
+                else:
+                    ve_pattern.append(None)
         assert len(ve_pattern) == len(self.blocks)
 
         # Initial embedding (matches train_gpt.py line 474)
@@ -194,13 +220,44 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.lm_head(x).float()
         
-        # Tanh softcapping (matches train_gpt.py line 494)
-        logits = 30 * torch.tanh(logits / (7.5 * x.size(-1)**0.5))
+        # Tanh softcapping (matches train_gpt.py line 494) - use config values
+        softcap_scale = self.config.get('training.model.tanh_softcap_scale', 30.0) if self.config else 30.0
+        softcap_divisor = self.config.get('training.model.tanh_softcap_divisor', 7.5) if self.config else 7.5
+        logits = softcap_scale * torch.tanh(logits / (softcap_divisor * x.size(-1)**0.5))
         
         return logits
 
-def load_checkpoint_proper(checkpoint_path: str, device='cuda'):
-    """Load model with proper architecture matching train_gpt.py"""
+def load_arithmetic_tokenizer(config):
+    """Load the arithmetic tokenizer"""
+    # Use new path structure
+    tokenizer_dir = config.get('paths.tokenizer_dir', 'data/tokenizers')
+    tokenizer_filename = config.get('paths.tokenizer_file', 'tokenizer.json')
+    vocab_filename = config.get('paths.vocab_info_file', 'tokenizer_vocab.json')
+    
+    tokenizer_path = os.path.join(tokenizer_dir, tokenizer_filename)
+    
+    # Fallback to old path for backward compatibility
+    if not os.path.exists(tokenizer_path):
+        tokenizer_path = config.get('tokenizer.save_path', 'data/tokenizer.json')
+    if not os.path.exists(tokenizer_path):
+        raise FileNotFoundError(f"Tokenizer not found at {tokenizer_path}. Run create_tokenizer.py first.")
+    
+    tokenizer = Tokenizer.from_file(tokenizer_path)
+    
+    # Load vocabulary info using new or old path structure  
+    if tokenizer_path.startswith(tokenizer_dir):
+        vocab_path = os.path.join(tokenizer_dir, vocab_filename)
+    else:
+        vocab_path = tokenizer_path.replace('.json', '_vocab.json')
+    vocab_info = {}
+    if os.path.exists(vocab_path):
+        with open(vocab_path, 'r') as f:
+            vocab_info = json.load(f)
+    
+    return tokenizer, vocab_info
+
+def load_checkpoint_arithmetic(checkpoint_path: str, config, device='cuda'):
+    """Load model with arithmetic-specific architecture"""
     print(f"Loading checkpoint: {checkpoint_path}")
     
     if not os.path.exists(checkpoint_path):
@@ -209,14 +266,21 @@ def load_checkpoint_proper(checkpoint_path: str, device='cuda'):
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     print(f"Checkpoint loaded - Step: {checkpoint.get('step', 'Unknown')}")
     
-    # Standard modded-nanogpt parameters
+    # Get parameters from config
+    tokenizer, vocab_info = load_arithmetic_tokenizer(config)
+    vocab_size = vocab_info.get('vocab_size', config.get('training.model.vocab_size', 20))
+    
     model = GPT(
-        vocab_size=50257,  # Will be rounded to 50304
-        num_layers=12,
-        num_heads=6,
-        model_dim=768,
-        max_seq_len=2048  # Smaller for inference
+        vocab_size=vocab_size,
+        num_layers=config.get('training.model.num_layers', 6),
+        num_heads=config.get('training.model.num_heads', 4),
+        model_dim=config.get('training.model.model_dim', 512),
+        max_seq_len=config.get('training.model.max_seq_len', 64),
+        config=config
     )
+    
+    print(f"Model architecture: vocab_size={vocab_size}, num_layers={model.num_layers}, "
+          f"num_heads={model.num_heads}, model_dim={model.model_dim}")
     
     # Load state dict with proper key mapping
     state_dict = checkpoint['model']
@@ -229,22 +293,15 @@ def load_checkpoint_proper(checkpoint_path: str, device='cuda'):
         else:
             new_state_dict[key] = value
     
-    # Load with strict=False to handle rotary embeddings which are computed, not loaded
+    # Load with strict=False to handle missing/extra keys
     missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)
     
-    # Filter out expected missing keys (rotary embeddings are computed)
-    expected_missing = [k for k in missing_keys if 'rotary.inv_freq' in k or 'rotary.cos_cached' in k or 'rotary.sin_cached' in k]
-    actual_missing = [k for k in missing_keys if k not in expected_missing]
-    
-    if actual_missing:
-        print(f"Actually missing keys: {len(actual_missing)}")
-        for key in actual_missing[:5]:
+    if missing_keys:
+        print(f"Missing keys: {len(missing_keys)}")
+        for key in missing_keys[:5]:
             print(f"  - {key}")
-        if len(actual_missing) > 5:
-            print(f"  ... and {len(actual_missing) - 5} more")
-    
-    if expected_missing:
-        print(f"Expected missing keys (rotary embeddings): {len(expected_missing)}")
+        if len(missing_keys) > 5:
+            print(f"  ... and {len(missing_keys) - 5} more")
     
     if unexpected_keys:
         print(f"Unexpected keys: {len(unexpected_keys)}")
@@ -252,10 +309,10 @@ def load_checkpoint_proper(checkpoint_path: str, device='cuda'):
     # Move to device
     if device == 'cuda' and torch.cuda.is_available():
         model = model.cuda()
-        print(f"Model moved to CUDA")
+        print("Model moved to CUDA")
     else:
         device = 'cpu'
-        print(f"Model on CPU")
+        print("Model on CPU")
     
     model.eval()
     
@@ -263,101 +320,124 @@ def load_checkpoint_proper(checkpoint_path: str, device='cuda'):
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Model ready - {total_params:,} parameters on {device}")
     
-    return model, device
+    return model, tokenizer, vocab_info, device
 
-def generate_text(model, tokenizer, prompt: str, max_length: int = 50, 
-                 temperature: float = 0.8, top_p: float = 0.9, top_k: int = 50, 
-                 repetition_penalty: float = 1.1, device: str = 'cuda'):
-    """Generate text from prompt"""
+def generate_arithmetic(model, tokenizer, prompt: str, max_length: int = None, device: str = 'cuda', config=None):
+    """Generate completion deterministically using configurable split token"""
     model.eval()
     
+    # Use config defaults if not provided
+    if max_length is None:
+        max_length = config.get('inference.max_length', 20) if config else 20
+    debug_top_k = config.get('inference.debug_top_k', 3) if config else 3
+    debug_steps = config.get('inference.debug_steps', 5) if config else 5
+    max_seq_len_check = config.get('training.evaluation.max_seq_len_check', 64) if config else 64
+    
+    # Get configurable split token
+    split_token = config.get('data_loader.split_token', '=') if config else '='
+    
     # Encode prompt
-    tokens = tokenizer.encode(prompt)
-    tokens = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)  # Add batch dim
+    encoded = tokenizer.encode(prompt)
+    tokens = torch.tensor(encoded.ids, dtype=torch.long, device=device).unsqueeze(0)
+    
+    print(f"Input tokens: {encoded.tokens}")
+    print(f"Input IDs: {encoded.ids}")
     
     with torch.no_grad():
-        for _ in range(max_length):
+        for i in range(max_length):
             # Forward pass
             logits = model(tokens)
             
             # Get next token logits
             next_logits = logits[0, -1, :]
             
-            # Apply repetition penalty
-            if repetition_penalty != 1.0:
-                for token_id in set(tokens[0].tolist()):
-                    next_logits[token_id] /= repetition_penalty
+            # Always use greedy decoding (deterministic)
+            next_token = torch.argmax(next_logits, dim=-1, keepdim=True)
             
-            # Apply temperature
-            next_logits = next_logits / temperature
+            # Show top predictions for debugging
+            if i < debug_steps:
+                top_k = debug_top_k
+                top_logits, top_indices = torch.topk(next_logits, top_k)
+                top_tokens = [tokenizer.decode([idx.item()]) for idx in top_indices]
+                print(f"Step {i+1} top predictions: {list(zip(top_tokens, top_logits.tolist()))}")
+                print(f"Chosen: {tokenizer.decode([next_token.item()])}")
             
-            # Apply top-k filtering
-            if top_k > 0:
-                top_k_actual = min(top_k, next_logits.size(-1))
-                indices_to_remove = next_logits < torch.topk(next_logits, top_k_actual)[0][..., -1, None]
-                next_logits[indices_to_remove] = float('-inf')
-            
-            # Apply top-p (nucleus) filtering
-            if top_p < 1.0:
-                sorted_logits, sorted_indices = torch.sort(next_logits, descending=True)
-                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-                sorted_indices_to_remove[0] = False
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                next_logits[indices_to_remove] = float('-inf')
-            
-            # Convert to probabilities and sample
-            probs = F.softmax(next_logits, dim=-1)
-            next_token = torch.multinomial(probs, 1)
             tokens = torch.cat([tokens, next_token.unsqueeze(0)], dim=1)
             
-            # Stop at EOS token
-            if next_token.item() == 50256:
+            # Decode to check if we should stop
+            current_tokens = tokens[0].cpu().tolist()
+            decoded = tokenizer.decode(current_tokens)
+            
+            # Stop at EOS token or when sequence gets too long
+            if len(current_tokens) > 0 and (decoded.endswith('[EOS]') or len(current_tokens) >= max_seq_len_check):
+                print("Stopping: EOS detected or max length reached")
                 break
     
-    # Decode generated text
+    # Decode generated sequence
     generated_tokens = tokens[0].cpu().tolist()
     generated_text = tokenizer.decode(generated_tokens)
     
-    return generated_text
+    # Extract answer (everything after split token)
+    answer = extract_answer(generated_text, split_token)
+    
+    return generated_text, generated_tokens, answer
+
+def extract_answer(text: str, split_token: str = '=') -> str:
+    """Extract answer portion from generated text (everything after split token)"""
+    if split_token in text:
+        parts = text.split(split_token, 1)  # Split only on first occurrence
+        if len(parts) > 1:
+            answer = parts[1].strip()
+            # Remove [EOS] if present
+            if answer.endswith('[EOS]'):
+                answer = answer[:-5].strip()
+            return answer
+    
+    # If no split token found, return everything after [BOS] if present
+    if '[BOS]' in text:
+        return text.split('[BOS]', 1)[1].strip()
+    
+    return text.strip()
 
 def main():
-    parser = argparse.ArgumentParser(description='Proper inference for modded-nanogpt')
+    parser = argparse.ArgumentParser(description='Arithmetic inference for modded-nanogpt')
     parser.add_argument('checkpoint', help='Path to checkpoint file')
+    parser.add_argument('--config', default='config.yaml', help='Config file path')
     parser.add_argument('--device', default='cuda', choices=['cuda', 'cpu'])
-    parser.add_argument('--prompt', default='The quick brown fox', help='Text prompt')
-    parser.add_argument('--max-length', type=int, default=50, help='Max generation length')
-    parser.add_argument('--temperature', type=float, default=0.8, help='Sampling temperature')
-    parser.add_argument('--top-p', type=float, default=0.9, help='Top-p (nucleus) sampling')
-    parser.add_argument('--top-k', type=int, default=50, help='Top-k sampling')
-    parser.add_argument('--repetition-penalty', type=float, default=1.1, help='Repetition penalty')
+    parser.add_argument('--prompt', default=None, help='Arithmetic prompt')
+    parser.add_argument('--max-length', type=int, default=20, help='Max generation length')
     
     args = parser.parse_args()
     
     try:
-        # Load model
-        model, device = load_checkpoint_proper(args.checkpoint, args.device)
+        # Load config
+        config = load_config()
         
-        # Load tokenizer
-        print("Loading GPT-2 tokenizer...")
-        tokenizer = tiktoken.get_encoding("gpt2")
-        
-        # Generate text
-        print(f"\nGenerating from prompt: '{args.prompt}'")
-        print("-" * 50)
-        
-        generated = generate_text(
-            model, tokenizer, args.prompt, 
-            max_length=args.max_length, 
-            temperature=args.temperature,
-            top_p=getattr(args, 'top_p', 0.9),
-            top_k=getattr(args, 'top_k', 50), 
-            repetition_penalty=getattr(args, 'repetition_penalty', 1.1),
-            device=device
+        # Load model and tokenizer
+        model, tokenizer, vocab_info, device = load_checkpoint_arithmetic(
+            args.checkpoint, config, args.device
         )
         
-        print(generated)
+        print(f"Vocabulary size: {vocab_info.get('vocab_size', 'Unknown')}")
+        print(f"Special tokens: {vocab_info.get('special_tokens', {})}")
+        
+        # Generate arithmetic completion
+        # Use default prompt from config if not provided
+        prompt = args.prompt if args.prompt is not None else config.get('inference.default_prompt', '[BOS] 5 + 3 =')
+        
+        print(f"\nGenerating from prompt: '{prompt}'")
+        print("-" * 50)
+        
+        generated_text, generated_tokens, answer = generate_arithmetic(
+            model, tokenizer, prompt,
+            max_length=args.max_length,
+            device=device,
+            config=config
+        )
+        
+        print(f"Generated: {generated_text}")
+        print(f"Token IDs: {generated_tokens}")
+        print(f"Extracted Answer: '{answer}'")
         
     except Exception as e:
         print(f"Error: {e}")

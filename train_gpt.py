@@ -6,9 +6,11 @@ import uuid
 import time
 import copy
 import glob
-from dataclasses import dataclass
 from functools import lru_cache, partial # Added partial for hook registration
 from pathlib import Path
+from utils.config_loader import load_config
+from utils.data import JSONDataLoader
+import json
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -304,10 +306,11 @@ class CastedLinear(nn.Linear):
             return F.linear(x, self.weight.type_as(x))
 
 class Rotary(nn.Module):
-    def __init__(self, dim: int, max_seq_len: int):
+    def __init__(self, dim: int, max_seq_len: int, config=None):
         super().__init__()
         # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
-        angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
+        base_freq = config.get('training.model.rope_base_freq', 1024) if config else 1024
+        angular_freq = (1 / base_freq) ** torch.linspace(0, 1, steps=dim//4, dtype=torch.float32)
         angular_freq = torch.cat([angular_freq, angular_freq.new_zeros(dim//4)])
         t = torch.arange(max_seq_len, dtype=torch.float32)
         theta = torch.einsum("i,j -> ij", t, angular_freq)
@@ -323,22 +326,22 @@ class Rotary(nn.Module):
         return torch.cat((y1, y2), 3).type_as(x_BTHD)
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, head_dim=128):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, config=None):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = head_dim
-        hdim = num_heads * head_dim
+        self.head_dim = config.get('training.model.head_dim', 128) if config else 128
+        hdim = num_heads * self.head_dim
         std = 0.5 * (dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
         # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
         # https://x.com/hi_tysam/status/1879699187107033311
         self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.rotary = Rotary(head_dim, max_seq_len)
+        self.rotary = Rotary(self.head_dim, max_seq_len, config)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
         # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
         # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
-        self.attn_scale = 0.12
+        self.attn_scale = config.get('training.model.attn_scale', 0.12) if config else 0.12
 
     def forward(self, x: Tensor, ve: Tensor | None, lambdas: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
@@ -356,9 +359,10 @@ class CausalSelfAttention(nn.Module):
         return y
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, config=None):
         super().__init__()
-        hdim = 4 * dim
+        mlp_ratio = config.get('training.model.mlp_ratio', 4) if config else 4
+        hdim = mlp_ratio * dim
         self.c_fc = CastedLinear(dim, hdim)
         self.c_proj = CastedLinear(hdim, dim)
         self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
@@ -370,11 +374,13 @@ class MLP(nn.Module):
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, config=None):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng - adapt for different num_layers
+        num_layers = config.get('training.model.num_layers', 12) if config else 12
+        skip_layer = num_layers // 2 + 1 if num_layers > 7 else 7
+        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len, config) if layer_idx != skip_layer else None
+        self.mlp = MLP(dim, config)
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
         x = lambdas[0] * x + lambdas[1] * x0
@@ -390,14 +396,16 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, config=None):
         super().__init__()
-        vocab_size = next_multiple_of_n(vocab_size, n=128)
+        self.config = config  # Store config for use in forward method
+        vocab_multiple = config.get('training.model.vocab_multiple', 128) if config else 128
+        vocab_size = next_multiple_of_n(vocab_size, n=vocab_multiple)
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i, config) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=False, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
@@ -420,7 +428,7 @@ class GPT(nn.Module):
         self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
-        BLOCK_SIZE = 128
+        BLOCK_SIZE = 64
         docs = (input_seq == 50256).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
@@ -430,7 +438,7 @@ class GPT(nn.Module):
 
         def dense_to_ordered(dense_blockmask: Tensor):
             num_blocks = dense_blockmask.sum(dim=-1, dtype=torch.int32)
-            indices = dense_blockmask.argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
+            indices = dense_blockmask.float().argsort(dim=-1, descending=False, stable=True).flip(-1).to(torch.int32)
             return num_blocks[None, None].contiguous(), indices[None, None].contiguous()
 
         # manual block mask creation by @YouJiacheng
@@ -463,12 +471,32 @@ class GPT(nn.Module):
         assert input_seq.ndim == 1
 
         ve = [value_embed(input_seq) for value_embed in self.value_embeds]
-        # 012 ... 012 structure on token value embeddings by @YouJiacheng, improved on @leloykun's U-net structure
-        ve = [ve[0], ve[1], ve[2]] + [None] * (len(self.blocks) - 6) + [ve[0], ve[1], ve[2]]
+        # Adapt value embedding structure to actual number of layers
+        num_layers = len(self.blocks)
+        if num_layers >= 6:
+            # Original pattern for 6+ layers: 012...012
+            ve_pattern = [ve[0], ve[1], ve[2]] + [None] * (num_layers - 6) + [ve[0], ve[1], ve[2]]
+        else:
+            # For fewer layers, distribute the available embeddings
+            ve_pattern = []
+            for i in range(num_layers):
+                if i < len(ve):
+                    ve_pattern.append(ve[i])
+                else:
+                    ve_pattern.append(None)
+        ve = ve_pattern
         assert len(ve) == len(self.blocks)
 
         long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
-        block_masks = [long_bm, short_bm, short_bm, short_bm, long_bm, short_bm, short_bm, long_bm, short_bm, short_bm, short_bm, long_bm]
+        # Create block masks dynamically based on actual number of layers
+        num_layers = len(self.blocks)
+        block_masks = []
+        for i in range(num_layers):
+            # Alternate between long and short masks, with more long masks for better coverage
+            if i % 4 == 0:  # Every 4th layer uses long mask
+                block_masks.append(long_bm)
+            else:
+                block_masks.append(short_bm)
         assert len(block_masks) == len(self.blocks)
 
         x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
@@ -491,7 +519,10 @@ class GPT(nn.Module):
         x = norm(x)
         logits = self.lm_head(x).float()
         # @Grad62304977 added tanh softcapping following Gemma 2 paper, @KoszarskyB reduced it from 30 to 15, @YouJiacheng shifted it by +15 (2*sigmoid(2*x)=tanh(x)+1)
-        logits = 30 * torch.sigmoid(logits / (7.5 * x.size(-1)**0.5))
+        # Use config values for softcapping
+        softcap_scale = self.config.get('training.model.tanh_softcap_scale', 30.0) if self.config else 30.0
+        softcap_divisor = self.config.get('training.model.tanh_softcap_divisor', 7.5) if self.config else 7.5
+        logits = softcap_scale * torch.sigmoid(logits / (softcap_divisor * x.size(-1)**0.5))
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, reduction="sum" if self.training else "mean")
         return loss
 
@@ -525,6 +556,73 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
             start = end
     assert False # increase max_batch_span if necessary
 
+def arithmetic_data_generator(json_file: str, sequence_length: int, config, is_training: bool = True):
+    """
+    Data generator for arithmetic JSON data that mimics distributed_data_generator.
+    
+    Args:
+        json_file: Path to JSON file
+        sequence_length: Tokens per rank (must be divisible by BLOCK_SIZE=64)
+        config: Configuration object
+        is_training: Whether this is for training (affects shuffling)
+        
+    Yields:
+        tuple: (inputs, targets) 1D tensors of size sequence_length
+    """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    
+    # Load JSON data
+    data_loader = JSONDataLoader(json_file, config)
+    vocab_size = data_loader.get_vocab_size()
+    
+    print(f"Loaded {len(data_loader)} examples from {json_file}")
+    print(f"Vocabulary size: {vocab_size}")
+    print(f"Sequence length per rank: {sequence_length} tokens")
+    
+    # Convert examples to tokens and concatenate them like the original
+    # Use masked examples for arithmetic training (only learn to predict after "=")
+    all_tokens = []
+    for i in range(len(data_loader)):
+        tokens = data_loader.get_masked_example(i)
+        all_tokens.extend(tokens.tolist())
+    
+    # Add padding to make it divisible by sequence_length for all ranks
+    total_tokens_needed = sequence_length * world_size
+    while len(all_tokens) % total_tokens_needed != 0:
+        all_tokens.append(config.get('tokenizer.token_ids.pad_token_id', 3))
+    
+    tokens_tensor = torch.tensor(all_tokens, dtype=torch.long)
+    pos = 0
+    
+    while True:
+        # Get chunk for this rank, similar to original distributed_data_generator
+        if pos + total_tokens_needed >= len(tokens_tensor):
+            pos = 0  # Reset to beginning
+            if is_training:
+                # Shuffle the data for training
+                indices = torch.randperm(len(tokens_tensor))
+                tokens_tensor = tokens_tensor[indices]
+        
+        # Get the slice for this rank
+        start_idx = pos + rank * sequence_length
+        buf = tokens_tensor[start_idx:start_idx + sequence_length + 1]
+        
+        if len(buf) < sequence_length + 1:
+            # Pad if needed
+            pad_size = sequence_length + 1 - len(buf)
+            pad_token_id = config.get('tokenizer.token_ids.pad_token_id', 3)
+            padding = torch.full((pad_size,), pad_token_id, dtype=torch.long)
+            buf = torch.cat([buf, padding])
+        
+        # Create input/target pairs exactly like the original
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
+        
+        pos += total_tokens_needed
+        yield inputs, targets
+
+
 def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -552,23 +650,45 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 # -----------------------------------------------------------------------------
 # int main
 
-@dataclass
-class Hyperparameters:
-    # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
-    #train_seq_len = train_seq_len // 8
-    #val_seq_len = val_seq_len // 8
-    # optimization
-    num_iterations = 1750 # number of iterations to run
-    cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
-    # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
-    save_checkpoint = True
-args = Hyperparameters()
+# Load configuration from YAML file
+config = load_config()
+
+# Create args-like object for backward compatibility
+class Args:
+    def __init__(self, config):
+        # data
+        dataset_dir = config.get('paths.dataset_dir', 'data/datasets')
+        train_file = config.get('paths.train_file', 'train.json')
+        test_file = config.get('paths.test_file', 'test.json')
+        self.train_files = f"{dataset_dir}/{train_file}"
+        self.val_files = f"{dataset_dir}/{test_file}"
+        # Data loading configuration - everything derived from config
+        self.batch_size = config.get('data_loader.batch_size', 64)  # Total examples per step (all ranks)
+        self.sequence_length = config.get('training.data.sequence_length', 4096)  # Tokens per rank
+        self.world_size = config.get('training.data.world_size', 8)
+        
+        # Validate that sequence_length is compatible with model requirements
+        block_size = config.get('training.attention.block_size', 64)
+        assert self.sequence_length % block_size == 0, f"sequence_length ({self.sequence_length}) must be divisible by block_size ({block_size})"
+        # optimization - calculate iterations from epochs or use direct iterations
+        num_epochs = config.get('training.lr_schedule.num_epochs', None)
+        if num_epochs is not None:
+            # Calculate iterations from epochs and dataset size
+            train_examples = config.get('dataset.train_examples', 12880)
+            total_batch_size = self.batch_size  # batch_size is already total across all ranks
+            steps_per_epoch = (train_examples + total_batch_size - 1) // total_batch_size  # Ceiling division
+            self.num_iterations = num_epochs * steps_per_epoch
+            print(f"Epoch-based training: {num_epochs} epochs × {steps_per_epoch} steps/epoch = {self.num_iterations} total iterations")
+        else:
+            self.num_iterations = config.get('training.lr_schedule.num_iterations', 1750)
+            print(f"Iteration-based training: {self.num_iterations} iterations")
+        
+        self.cooldown_frac = config.get('training.lr_schedule.cooldown_frac', 0.45)
+        # evaluation and logging
+        self.val_loss_every = config.get('training.evaluation.val_loss_every', 125)
+        self.save_checkpoint = config.get('training.evaluation.save_checkpoint', True)
+
+args = Args(config)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -607,7 +727,23 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+# Get vocabulary size from data
+print0("Loading data to determine vocabulary size...")
+temp_loader = JSONDataLoader(args.train_files, config)
+actual_vocab_size = temp_loader.get_vocab_size()
+print0(f"Detected vocabulary size: {actual_vocab_size}")
+
+# Update config with actual vocab size
+config.set('training.model.vocab_size', actual_vocab_size)
+
+model: nn.Module = GPT(
+    vocab_size=actual_vocab_size, 
+    num_layers=config.get('training.model.num_layers', 12), 
+    num_heads=config.get('training.model.num_heads', 6), 
+    model_dim=config.get('training.model.model_dim', 768), 
+    max_seq_len=args.sequence_length,
+    config=config
+).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -623,8 +759,17 @@ head_params = [model.lm_head.weight]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
+adam_lr = float(config.get('training.optimizer.adam.lr', 0.008))
+adam_betas = list(config.get('training.optimizer.adam.betas', [0.8, 0.95]))
+adam_eps = float(config.get('training.optimizer.adam.eps', 1e-10))
+adam_weight_decay = float(config.get('training.optimizer.adam.weight_decay', 0.0))
+
+muon_lr = float(config.get('training.optimizer.muon.lr', 0.05))
+muon_momentum = float(config.get('training.optimizer.muon.momentum', 0.95))
+muon_weight_decay = float(config.get('training.optimizer.muon.weight_decay', 0.0))
+
+optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=adam_lr, betas=adam_betas, eps=adam_eps, weight_decay=adam_weight_decay)
+optimizer2 = Muon(hidden_matrix_params, lr=muon_lr, momentum=muon_momentum, weight_decay=muon_weight_decay)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -638,31 +783,42 @@ def get_lr(step: int):
         return 1.0
     else:
         w = (1 - x) / args.cooldown_frac
-        return w * 1.0 + (1 - w) * 0.1
+        final_lr_ratio = config.get('training.lr_schedule.final_lr_ratio', 0.1)
+        return w * 1.0 + (1 - w) * final_lr_ratio
 
 # attention window size schedule: linearly increase
 @lru_cache(1)
 def get_window_size_blocks_helper(window_size: int):
-    return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    block_size = config.get('training.attention.block_size', 64)
+    return torch.tensor(window_size // block_size, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
 def get_window_size_blocks(step: int):
     x = step / args.num_iterations # progress in training
     assert 0 <= x <= 1
-    # Linearly increase the block-wise sliding window size over training 128 -> 1792
+    # Linearly increase the block-wise sliding window size over training
     # increase by @fernbear.bsky.social; block-wise by @YouJiacheng
-    window_size = next_multiple_of_n(1728 * x, n=128)
+    max_window = config.get('training.attention.max_window_size', 1728)
+    min_window = config.get('training.attention.min_window_size', 128) 
+    block_size = config.get('training.attention.block_size', 128)
+    window_size = next_multiple_of_n(min_window + (max_window - min_window) * x, n=block_size)
     return get_window_size_blocks_helper(window_size)
 
-model: nn.Module = torch.compile(model, dynamic=False)
+# Compile model if enabled in config
+if config.get('training.hardware.compile_model', True):
+    model: nn.Module = torch.compile(model, dynamic=False)
+else:
+    print0("Model compilation disabled in config")
+    # model already defined above, just add type annotation
+    model: nn.Module = model
 
 ########################################
 #            Warmup kernels            #
 ########################################
 
 # Warmup the training kernels, then re-initialize the state so we aren't cheating
-warmup_steps = 10
+warmup_steps = config.get('training.hardware.warmup_steps', 10)
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = arithmetic_data_generator(args.train_files, args.sequence_length, config, is_training=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -678,7 +834,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = arithmetic_data_generator(args.train_files, args.sequence_length, config, is_training=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -694,16 +850,18 @@ for step in range(train_steps + 1):
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
         model.eval()
-        val_batch_size = world_size * args.val_seq_len
-        assert args.val_tokens % val_batch_size == 0
-        val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        # Calculate validation steps to process entire test set once
+        test_examples = config.get('dataset.test_examples', 1024)  
+        val_steps = max(1, (test_examples + args.batch_size - 1) // args.batch_size)  # Ceiling division
+        val_loader = arithmetic_data_generator(args.val_files, args.sequence_length, config, is_training=False)
         val_loss = 0
+        val_batches_processed = 0
         with torch.no_grad():
             for _ in range(val_steps):
                 inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
-        val_loss /= val_steps
+                val_batches_processed += 1
+        val_loss /= val_batches_processed
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
@@ -727,9 +885,10 @@ for step in range(train_steps + 1):
     for opt in optimizers:
         for group in opt.param_groups:
             group["lr"] = group["initial_lr"] * get_lr(step)
+    momentum_warmup_steps = config.get('training.optimizer.muon.momentum_warmup_steps', 300)
     for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+        frac = min(step / momentum_warmup_steps, 1) # momentum warmup for muon
+        group["momentum"] = (1 - frac) * 0.85 + frac * muon_momentum
     # step the optimizers
     for opt in optimizers:
         opt.step()
