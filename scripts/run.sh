@@ -2,7 +2,7 @@
 #SBATCH --job-name=train_modded
 #SBATCH --output=logs/train/train_%j.out
 #SBATCH --error=logs/train/train_%j.err
-#SBATCH --time=00:30:00
+#SBATCH --time=02:00:00
 #SBATCH --account=OPEN-34-14
 #SBATCH --nodes=1
 #SBATCH --ntasks=1

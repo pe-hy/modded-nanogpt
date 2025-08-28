@@ -14,14 +14,14 @@ class JSONDataLoader:
         Args:
             json_file: Path to JSON file with format [{"text": "example 1"}, {"text": "example 2"}, ...]
             config: Configuration object. If provided, overrides individual parameters.
-            mask_token: Token ID to use as mask/separator (default from config or 50256)
+            mask_token: Token ID to use as mask/separator (default EOS token from tokenizer config)
             tokenizer_encode_fn: Function to encode text to token IDs (default from config)
         """
         if config is None:
             config = load_config()
         
         self.config = config
-        self.mask_token = mask_token if mask_token is not None else config.get('dataset.mask_token', 50256)
+        self.mask_token = mask_token if mask_token is not None else config.get('tokenizer.token_ids.eos_token_id', 1)
         self.max_length = config.get('data_loader.max_length', 64)
         
         # Load tokenizer if available and enabled

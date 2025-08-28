@@ -159,18 +159,12 @@ class GPT(nn.Module):
         # Language modeling head (simplified, no FP8)
         self.lm_head = CastedLinear(model_dim, vocab_size, bias=False)
         
-        # Scalars parameter (matches checkpoint size)
-        # For 6-layer model, the checkpoint has 32 scalars
-        if config:
-            if num_layers == 6:
-                scalar_size = config.get('training.model.scalars_size_6_layers', 32)
-            else:
-                base = config.get('training.model.scalars_size_formula_base', 64)
-                mult = config.get('training.model.scalars_size_formula_multiplier', 5)
-                offset = config.get('training.model.scalars_size_formula_offset', 16)
-                scalar_size = max(base, mult * num_layers + offset)
-        else:
-            scalar_size = 32 if num_layers == 6 else max(64, 5 * num_layers + 16)
+        # Scalars parameter - match training code exactly
+        # Training uses: num_layers + 2*num_layers + 2*num_layers + pad = 5*num_layers + pad
+        # where pad = (-num_layers * 5) % world_size
+        world_size = config.get('training.data.world_size', 8) if config else 8
+        pad = (-num_layers * 5) % world_size
+        scalar_size = 5 * num_layers + pad
         self.scalars = nn.Parameter(torch.ones(scalar_size))
         
         self.vocab_size = vocab_size
@@ -182,8 +176,12 @@ class GPT(nn.Module):
         assert input_seq.ndim == 2  # (batch_size, seq_len)
         B, T = input_seq.shape
         
+        # Replace -100 tokens with pad token for embedding lookup (matches train_gpt.py)
+        pad_token_id = 3  # Use pad token ID from tokenizer
+        input_seq_clean = torch.where(input_seq == -100, pad_token_id, input_seq)
+        
         # Token value embeddings (adapt pattern for different num_layers)
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        ve = [value_embed(input_seq_clean) for value_embed in self.value_embeds]
         if self.num_layers >= 6:
             # Original pattern for 6+ layers: 012...012
             ve_pattern = [ve[0], ve[1], ve[2]] + [None] * (self.num_layers - 6) + [ve[0], ve[1], ve[2]]
@@ -198,7 +196,7 @@ class GPT(nn.Module):
         assert len(ve_pattern) == len(self.blocks)
 
         # Initial embedding (matches train_gpt.py line 474)
-        x = x0 = norm(self.embed(input_seq))
+        x = x0 = norm(self.embed(input_seq_clean))
 
         # Extract scalars (matches train_gpt.py lines 478-480)
         skip_weights = self.scalars[:(len(self.blocks) // 2)]
@@ -272,9 +270,9 @@ def load_checkpoint_arithmetic(checkpoint_path: str, config, device='cuda'):
     
     model = GPT(
         vocab_size=vocab_size,
-        num_layers=config.get('training.model.num_layers', 6),
-        num_heads=config.get('training.model.num_heads', 4),
-        model_dim=config.get('training.model.model_dim', 512),
+        num_layers=config.get('training.model.num_layers', 12),
+        num_heads=config.get('training.model.num_heads', 8),
+        model_dim=config.get('training.model.model_dim', 256),
         max_seq_len=config.get('training.model.max_seq_len', 64),
         config=config
     )
@@ -285,6 +283,7 @@ def load_checkpoint_arithmetic(checkpoint_path: str, config, device='cuda'):
     # Load state dict with proper key mapping
     state_dict = checkpoint['model']
     new_state_dict = {}
+    checkpoint_scalars_size = None
     
     for key, value in state_dict.items():
         if key.startswith('_orig_mod.'):
@@ -292,6 +291,27 @@ def load_checkpoint_arithmetic(checkpoint_path: str, config, device='cuda'):
             new_state_dict[new_key] = value
         else:
             new_state_dict[key] = value
+        
+        # Detect scalars size from checkpoint
+        if key.endswith('scalars') or key == '_orig_mod.scalars':
+            checkpoint_scalars_size = value.shape[0]
+    
+    # If scalars size doesn't match, recreate model with correct size
+    if checkpoint_scalars_size and checkpoint_scalars_size != model.scalars.shape[0]:
+        print(f"Scalars size mismatch: checkpoint has {checkpoint_scalars_size}, model has {model.scalars.shape[0]}")
+        print("Recreating model with correct scalars size...")
+        
+        # Recreate model with the correct scalars size
+        model = GPT(
+            vocab_size=vocab_size,
+            num_layers=config.get('training.model.num_layers', 12),
+            num_heads=config.get('training.model.num_heads', 8),
+            model_dim=config.get('training.model.model_dim', 256),
+            max_seq_len=config.get('training.model.max_seq_len', 64),
+            config=config
+        )
+        # Override scalars with correct size
+        model.scalars = nn.Parameter(torch.ones(checkpoint_scalars_size))
     
     # Load with strict=False to handle missing/extra keys
     missing_keys, unexpected_keys = model.load_state_dict(new_state_dict, strict=False)

@@ -45,7 +45,7 @@ data_loader:
 training:
   # Model architecture
   model:
-    vocab_size: 20  # Will be updated automatically by tokenizer (digits + operators + special tokens)
+    vocab_size: 17  # Updated to match actual tokenizer (digits + operators + special tokens)
     num_layers: 12  
     num_heads: 8   
     model_dim: 256  # 8 heads × 32 head_dim = 256
@@ -80,7 +80,7 @@ training:
   # Learning rate schedule
   lr_schedule:
     # Epoch-based or iteration-based training (choose one)
-    num_epochs: 10               # Set this to use epoch-based training
+    num_epochs: 40               # Set this to use epoch-based training
     num_iterations: null         # Used if num_epochs is null (legacy mode)
     cooldown_frac: 0.45          # Fraction of training to cooldown (0.45 = last 45%)
     final_lr_ratio: 0.1          # Final LR as ratio of initial LR

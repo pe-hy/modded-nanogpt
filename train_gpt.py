@@ -429,7 +429,7 @@ class GPT(nn.Module):
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 64
-        docs = (input_seq == 50256).cumsum(0)
+        docs = (input_seq == DOC_SEPARATOR_TOKEN_ID).cumsum(0)
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -470,7 +470,12 @@ class GPT(nn.Module):
     def forward(self, input_seq: Tensor, target_seq: Tensor, sliding_window_num_blocks: Tensor):
         assert input_seq.ndim == 1
 
-        ve = [value_embed(input_seq) for value_embed in self.value_embeds]
+        # Replace -100 tokens with pad token for embedding lookup, but preserve for loss computation
+        # This prevents CUDA indexing errors while maintaining correct masking for training
+        pad_token_id = 3  # Use pad token ID from tokenizer
+        input_seq_clean = torch.where(input_seq == -100, pad_token_id, input_seq)
+
+        ve = [value_embed(input_seq_clean) for value_embed in self.value_embeds]
         # Adapt value embedding structure to actual number of layers
         num_layers = len(self.blocks)
         if num_layers >= 6:
@@ -487,7 +492,7 @@ class GPT(nn.Module):
         ve = ve_pattern
         assert len(ve) == len(self.blocks)
 
-        long_bm, short_bm = self.create_blockmasks(input_seq, sliding_window_num_blocks)
+        long_bm, short_bm = self.create_blockmasks(input_seq_clean, sliding_window_num_blocks)
         # Create block masks dynamically based on actual number of layers
         num_layers = len(self.blocks)
         block_masks = []
@@ -499,7 +504,7 @@ class GPT(nn.Module):
                 block_masks.append(short_bm)
         assert len(block_masks) == len(self.blocks)
 
-        x = x0 = norm(self.embed(input_seq)[None]) # use of norm here by @Grad62304977
+        x = x0 = norm(self.embed(input_seq_clean)[None]) # use of norm here by @Grad62304977
 
         # U-net design by @brendanh0gan
         skip_connections = []
@@ -541,9 +546,9 @@ def _load_data_shard(file: Path):
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
     return tokens
 
-# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
+# find world_size starting indicies, such that each begins with document separator token and local_batches don't overlap
 def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
-    boundary_mask = tokens[pos : pos + max_batch_span] == 50256
+    boundary_mask = tokens[pos : pos + max_batch_span] == DOC_SEPARATOR_TOKEN_ID
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
     start = boundary_positions[0].item()
     starts = []
@@ -652,6 +657,10 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_
 
 # Load configuration from YAML file
 config = load_config()
+
+# Get document separator token ID from tokenizer configuration
+# Use EOS token (ID 1) for document separation based on current tokenizer
+DOC_SEPARATOR_TOKEN_ID = config.get('tokenizer.token_ids.eos_token_id', 1)
 
 # Create args-like object for backward compatibility
 class Args:
