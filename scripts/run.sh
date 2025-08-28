@@ -14,5 +14,6 @@
 module load Anaconda3/2024.02-1
 module load CUDA/12.4.0
 source activate main_env
-
+export CUDA_LAUNCH_BLOCKING=1
+unset PYTORCH_CUDA_ALLOC_CONF
 torchrun --standalone --nproc_per_node=8 train_gpt.py

@@ -15,4 +15,4 @@ module load Anaconda3/2024.02-1
 module load CUDA/12.4.0
 source activate main_env
 
-python inference.py logs/f5a8803e-6188-4325-8f85-c2d552670f4b/state_step002020.pt --prompt "[BOS] 5 + 3 ="
+python inference.py logs/be2af914-920d-455d-859d-a8011340c96f/state_step008040.pt --prompt "[BOS] 3 3 + 2 2 6 ="

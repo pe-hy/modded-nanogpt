@@ -87,12 +87,13 @@ training:
   
   # Attention window
   attention:
-    block_size: 64        # Match sequence length
+    block_size: 32        # Match sequence length
+    max_window_size: 64         # was: 1728  
   
   # Training data  
   data:
-    sequence_length: 4096  # Total tokens per rank (must be multiple of 64 for BLOCK_SIZE)
-    align_to_bos: true
+    sequence_length: 64  # Total tokens per rank (must be multiple of 64 for BLOCK_SIZE)
+    align_to_bos: false
     world_size: 8
   
   # Evaluation
@@ -104,7 +105,7 @@ training:
   # Hardware
   hardware:
     device: "cuda"
-    compile_model: false  # Disable compilation to avoid GEMM backend issues
+    compile_model: true  # Disable compilation to avoid GEMM backend issues
     use_fp8: false
     warmup_steps: 10
 

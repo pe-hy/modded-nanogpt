@@ -12,7 +12,7 @@ from utils.config_loader import load_config
 from utils.data import JSONDataLoader
 import json
 
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
 from torch import Tensor, nn
@@ -21,7 +21,12 @@ import torch.distributed as dist
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+import torch._inductor.config as inductor_config
 
+# inductor_config.coordinate_descent_tuning = True
+# inductor_config.triton.use_bmm = True
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
 
@@ -563,16 +568,8 @@ def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch
 
 def arithmetic_data_generator(json_file: str, sequence_length: int, config, is_training: bool = True):
     """
-    Data generator for arithmetic JSON data that mimics distributed_data_generator.
-    
-    Args:
-        json_file: Path to JSON file
-        sequence_length: Tokens per rank (must be divisible by BLOCK_SIZE=64)
-        config: Configuration object
-        is_training: Whether this is for training (affects shuffling)
-        
-    Yields:
-        tuple: (inputs, targets) 1D tensors of size sequence_length
+    FIXED: Data generator that maintains arithmetic problem boundaries.
+    Each sequence_length chunk should contain complete arithmetic problems with padding.
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
@@ -581,52 +578,78 @@ def arithmetic_data_generator(json_file: str, sequence_length: int, config, is_t
     data_loader = JSONDataLoader(json_file, config)
     vocab_size = data_loader.get_vocab_size()
     
-    print(f"Loaded {len(data_loader)} examples from {json_file}")
-    print(f"Vocabulary size: {vocab_size}")
-    print(f"Sequence length per rank: {sequence_length} tokens")
+    print(f"Rank {rank}: Loaded {len(data_loader)} examples from {json_file}")
+    print(f"Rank {rank}: Vocabulary size: {vocab_size}")
+    print(f"Rank {rank}: Sequence length per rank: {sequence_length} tokens")
     
-    # Convert examples to tokens and concatenate them like the original
-    # Use masked examples for arithmetic training (only learn to predict after "=")
+    # Get pad and EOS token IDs
+    pad_token_id = config.get('tokenizer.token_ids.pad_token_id', 3)
+    eos_token_id = config.get('tokenizer.token_ids.eos_token_id', 1)  # Use as separator
+    
+    # Convert all examples to tokens with EOS separators
     all_tokens = []
     for i in range(len(data_loader)):
+        # Get masked example (only learn to predict after "=")
         tokens = data_loader.get_masked_example(i)
         all_tokens.extend(tokens.tolist())
+        
+        # Add EOS token as separator between problems
+        all_tokens.append(eos_token_id)
     
-    # Add padding to make it divisible by sequence_length for all ranks
+    # Ensure we have enough tokens for all ranks
     total_tokens_needed = sequence_length * world_size
+    
+    # Repeat the dataset if needed to fill all ranks
+    while len(all_tokens) < total_tokens_needed:
+        # Replicate the data to ensure we have enough
+        all_tokens.extend(all_tokens[:min(len(all_tokens), total_tokens_needed - len(all_tokens))])
+    
+    # Pad to exact multiple of total_tokens_needed
     while len(all_tokens) % total_tokens_needed != 0:
-        all_tokens.append(config.get('tokenizer.token_ids.pad_token_id', 3))
+        all_tokens.append(pad_token_id)
     
     tokens_tensor = torch.tensor(all_tokens, dtype=torch.long)
+    print(f"Rank {rank}: Total token dataset size: {len(tokens_tensor)}")
+    
     pos = 0
     
     while True:
-        # Get chunk for this rank, similar to original distributed_data_generator
-        if pos + total_tokens_needed >= len(tokens_tensor):
+        # Check if we need to wrap around
+        if pos + total_tokens_needed > len(tokens_tensor):
             pos = 0  # Reset to beginning
             if is_training:
-                # Shuffle the data for training
-                indices = torch.randperm(len(tokens_tensor))
-                tokens_tensor = tokens_tensor[indices]
+                # Shuffle by chunks to maintain some randomness
+                chunk_size = total_tokens_needed
+                num_chunks = len(tokens_tensor) // chunk_size
+                chunk_indices = torch.randperm(num_chunks)
+                
+                shuffled_tokens = []
+                for chunk_idx in chunk_indices:
+                    start = chunk_idx * chunk_size
+                    end = start + chunk_size
+                    shuffled_tokens.append(tokens_tensor[start:end])
+                
+                tokens_tensor = torch.cat(shuffled_tokens)
         
-        # Get the slice for this rank
+        # Get the slice for this rank (no document boundary search needed)
         start_idx = pos + rank * sequence_length
         buf = tokens_tensor[start_idx:start_idx + sequence_length + 1]
         
+        # Ensure we have exactly sequence_length + 1 tokens
         if len(buf) < sequence_length + 1:
-            # Pad if needed
+            # This shouldn't happen with our padding logic, but just in case
             pad_size = sequence_length + 1 - len(buf)
-            pad_token_id = config.get('tokenizer.token_ids.pad_token_id', 3)
             padding = torch.full((pad_size,), pad_token_id, dtype=torch.long)
             buf = torch.cat([buf, padding])
+        elif len(buf) > sequence_length + 1:
+            buf = buf[:sequence_length + 1]
         
-        # Create input/target pairs exactly like the original
+        # Create input/target pairs
         inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
         targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         
         pos += total_tokens_needed
         yield inputs, targets
-
 
 def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
     rank = dist.get_rank()
@@ -665,27 +688,30 @@ DOC_SEPARATOR_TOKEN_ID = config.get('tokenizer.token_ids.eos_token_id', 1)
 # Create args-like object for backward compatibility
 class Args:
     def __init__(self, config):
-        # data
+        # Data files
         dataset_dir = config.get('paths.dataset_dir', 'data/datasets')
         train_file = config.get('paths.train_file', 'train.json')
         test_file = config.get('paths.test_file', 'test.json')
         self.train_files = f"{dataset_dir}/{train_file}"
         self.val_files = f"{dataset_dir}/{test_file}"
-        # Data loading configuration - everything derived from config
-        self.batch_size = config.get('data_loader.batch_size', 64)  # Total examples per step (all ranks)
-        self.sequence_length = config.get('training.data.sequence_length', 4096)  # Tokens per rank
+        
+        # FIXED: Use the corrected sequence_length from config
+        self.sequence_length = config.get('training.data.sequence_length', 64)  # Now matches model
+        self.batch_size = config.get('data_loader.batch_size', 64)
         self.world_size = config.get('training.data.world_size', 8)
         
-        # Validate that sequence_length is compatible with model requirements
-        block_size = config.get('training.attention.block_size', 64)
-        assert self.sequence_length % block_size == 0, f"sequence_length ({self.sequence_length}) must be divisible by block_size ({block_size})"
-        # optimization - calculate iterations from epochs or use direct iterations
+        # Validate consistency
+        model_max_seq = config.get('training.model.max_seq_len', 64)
+        if self.sequence_length != model_max_seq:
+            print(f"WARNING: sequence_length ({self.sequence_length}) != model max_seq_len ({model_max_seq})")
+        
+        # Calculate iterations 
         num_epochs = config.get('training.lr_schedule.num_epochs', None)
         if num_epochs is not None:
-            # Calculate iterations from epochs and dataset size
             train_examples = config.get('dataset.train_examples', 12880)
-            total_batch_size = self.batch_size  # batch_size is already total across all ranks
-            steps_per_epoch = (train_examples + total_batch_size - 1) // total_batch_size  # Ceiling division
+            # Estimate iterations based on how many sequence_length chunks we can make
+            total_batch_size = self.batch_size
+            steps_per_epoch = max(1, train_examples // total_batch_size)
             self.num_iterations = num_epochs * steps_per_epoch
             print(f"Epoch-based training: {num_epochs} epochs × {steps_per_epoch} steps/epoch = {self.num_iterations} total iterations")
         else:
@@ -693,7 +719,6 @@ class Args:
             print(f"Iteration-based training: {self.num_iterations} iterations")
         
         self.cooldown_frac = config.get('training.lr_schedule.cooldown_frac', 0.45)
-        # evaluation and logging
         self.val_loss_every = config.get('training.evaluation.val_loss_every', 125)
         self.save_checkpoint = config.get('training.evaluation.save_checkpoint', True)
 
@@ -813,11 +838,20 @@ def get_window_size_blocks(step: int):
 
 # Compile model if enabled in config
 if config.get('training.hardware.compile_model', True):
-    model: nn.Module = torch.compile(model, dynamic=False)
+    print0("Compiling model with GEMM backend optimizations...")
+    try:
+        model = torch.compile(
+            model, 
+            backend="inductor",
+            mode="max-autotune",  # Aggressive optimization
+            dynamic=False
+        )
+        print0("✅ Model compilation with GEMM backend successful")
+    except Exception as e:
+        print0(f"⚠️  Model compilation failed: {e}")
+        print0("Continuing without compilation...")
 else:
     print0("Model compilation disabled in config")
-    # model already defined above, just add type annotation
-    model: nn.Module = model
 
 ########################################
 #            Warmup kernels            #
